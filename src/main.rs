@@ -7,8 +7,10 @@ use futures::future::FutureExt;
 
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
-use std::default;
+
 use std::env;
+
+use reqwest::Result;
 
 use tokio::task;
 
@@ -20,17 +22,11 @@ struct BusFactoratorArgs {
     language: String,
 
     /// Ammount of repos to evaluate
-    #[clap(long, default_value_t = 80)]
+    #[clap(long, default_value_t = 50)]
     project_count: u64,
 }
 
-use reqwest::Result;
-
-fn print_type_of<T>(_: &T) {
-    println!("{}", std::any::type_name::<T>())
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 12)]
 async fn main() -> Result<()> {
     let args = BusFactoratorArgs::parse();
 
@@ -38,7 +34,7 @@ async fn main() -> Result<()> {
         Ok(val) => {
             val
         },
-        Err(e) => panic!("couldn't interpret TOKEN: {}", e),
+        Err(e) => panic!("couldn't find env variable TOKEN: {}", e),
     };
 
     let token_string = token.to_string();
@@ -85,34 +81,29 @@ async fn main() -> Result<()> {
                 let bar_copy = bar.clone();
 
                 async move {
+                    bar_copy.set_message(format!("Processed data for repository {}", repo_info.0.full_name));
                     bar_copy.inc(1);
                     repo_info
                 }
             })
         })).await;
 
-    let asd = 1;
-
     let single_repos_infos_results_parsed : Vec<(SingleRepoInfo, Vec<RepoContributorsInfo>)> = single_repos_infos_results.into_iter()
         .map(|data| {
             let mut repo_info = data.0;
-            let most_commits = data.1.first().unwrap();
+            let most_commits = data.1.first().expect("list of contributors to repository is empty");
             repo_info.bus_factor = most_commits.contributions as f32 / repo_info.num_of_commits as f32;
 
-            //println!("Bus factor {} with user {}", repo_info.bus_factor, data.1.first().unwrap().login);
             (repo_info, data.1)
         })
         .filter(|data| data.0.bus_factor > 0.75f32).collect();
+
+    bar.finish_with_message("data collection finished");
 
     single_repos_infos_results_parsed.into_iter()
         .for_each(|data|{
             println!("project: {name} user: {user} percentage:{bus_factor}", name = data.0.full_name, user = data.1.first().unwrap().login, bus_factor = data.0.bus_factor);
         });
-    
-    
-
-    bar.finish();
-
     Ok(())
 }
 
@@ -120,7 +111,7 @@ async fn get_single_repo_info(repo_info : SingleRepoInfo, token : String, client
 {
     let num_of_pages = get_num_of_pages_for_contributors_on_main_branch(&repo_info, &client, &token).await?;
 
-    let pages : Vec<u64> = (1..num_of_pages + 2).into_iter().collect();
+    let pages : Vec<u64> = (1..num_of_pages + 1).into_iter().collect();
 
     let commit_infos_results = future::join_all(pages.iter()
         .map(|item| {
@@ -130,7 +121,7 @@ async fn get_single_repo_info(repo_info : SingleRepoInfo, token : String, client
                 .header("Accept", "application/vnd.github.v3+json")
                 .send()
                 .then(|response|{
-                    response.unwrap().text()
+                    response.map(|result|result.error_for_status().unwrap()).unwrap().text()
                 })
                 .then(|resp_text|{
                     async move {
@@ -220,33 +211,6 @@ struct RepoContributorsInfo {
 async fn parse_contributors_info(req : String) -> serde_json::Result<Vec<RepoContributorsInfo>>
 {
     let repositories_info : Vec<RepoContributorsInfo> = serde_json::from_str(&req)?;
-    Ok(repositories_info)
-}
-
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SingleAuthorDetails
-{
-    name : String,
-    email : String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SingleCommitDetails
-{
-    url : String,
-    author : SingleAuthorDetails,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SingleCommitInfo 
-{
-    commit : SingleCommitDetails,
-}
-
-async fn parse_commit_info(req : String) -> serde_json::Result<Vec<SingleCommitInfo>>
-{
-    let repositories_info : Vec<SingleCommitInfo> = serde_json::from_str(&req)?;
     Ok(repositories_info)
 }
 
