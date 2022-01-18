@@ -3,10 +3,13 @@ use serde::{Deserialize, Serialize};
 
 use futures::executor;
 use futures::future;
+use futures::future::FutureExt;
 
 use indicatif::ProgressBar;
-
+use indicatif::ProgressStyle;
 use std::env;
+
+use tokio::task;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -16,13 +19,17 @@ struct BusFactoratorArgs {
     language: String,
 
     /// Ammount of repos to evaluate
-    #[clap(long, default_value_t = 950)]
+    #[clap(long, default_value_t = 1)]
     project_count: u64,
 }
 
 use reqwest::Result;
 
-#[tokio::main]
+fn print_type_of<T>(_: &T) {
+    println!("{}", std::any::type_name::<T>())
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<()> {
     let args = BusFactoratorArgs::parse();
 
@@ -37,65 +44,101 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
 
-    let response = get_repositories_info(&token_string, args.language, args.project_count, &client).await;
+    let response = get_repositories_info(&token_string, args.language, args.project_count, client.clone()).await;
 
     let parsed_repos_info = match response {
         Ok(repos_info) => repos_info,
         Err(err) => {
-            panic!("Unable to retrieve or parse response\nErr string: {:#?}", err);
+            panic!("Unable to retrieve or parse repositories info: {:#?}", err);
         }
     };
 
-    let single_repos_infos_future = future::join_all(parsed_repos_info.into_iter()
-        .map(|repo_info| {
-            get_single_repo_info(repo_info, &token_string, &client)
-        }));
+    let spinner_style = ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .template("{prefix:.bold.dim} {spinner} {wide_msg}");
 
+    let bar = ProgressBar::new(parsed_repos_info.len().try_into().unwrap());
+
+    bar.set_style(spinner_style);
+
+    let single_repos_infos_results = future::join_all(parsed_repos_info.into_iter()
+        .map(|repo_info| {
+            let task_client = client.clone();
+            let task_token = token.clone();
+            task::spawn( async move {
+                get_single_repo_info(repo_info, task_token, task_client).await
+            }).then(|fut| {
+                let bar_copy = bar.clone();
+                let future_unwrapped = fut.expect("failed to retrieve future from tokio task, something went wrong big time");
+                
+                let repo_info = future_unwrapped.unwrap();
+                async move {
+                    bar_copy.inc(1);
+                    bar_copy.set_message(format!("Completed data gathering for repo {}", repo_info.0.full_name));
+                    repo_info
+                }
+            })
+        })).await;
+
+    single_repos_infos_results.iter()
+        .for_each(|repo|{
+            println!("Repo {} with {} commits", repo.0.full_name, repo.1.len());
+        });
+
+    bar.finish();
+    //let single_repos_infos : Vec<(SingleRepoInfo, Vec<SingleCommitInfo>)> = single_repos_infos_results.into_iter().map(|future| future.join()).collect(); 
+    
+    // let single_repos_infos : Vec<(SingleRepoInfo, Vec<SingleCommitInfo>)> = single_repos_infos_results.into_iter()
+    //     .map(|result|{
+    //         result.unwrap().unwrap()
+    //     }).collect();
+    
     Ok(())
 }
 
-async fn get_single_repo_info(repo_info : SingleRepoInfo, token : &String, client : &reqwest::Client) -> Result<(SingleRepoInfo, Vec<SingleCommitInfo>)>
+async fn get_single_repo_info(mut repo_info : SingleRepoInfo, token : String, client : reqwest::Client) -> Result<(SingleRepoInfo, Vec<SingleCommitInfo>)>
 {
-    let num_of_commits = get_num_of_commits_on_main_branch(&repo_info, &client, token);
+    let num_of_commits = get_num_of_commits_on_main_branch(&repo_info, &client, &token).await?;
 
-    println!("number of commits on {repo_name} is {num}", repo_name = repo_info.name, num = num_of_commits);
+    repo_info.num_of_commits = num_of_commits;
 
     let number_of_pages = num_of_commits / 100;
 
     let pages : Vec<u64> = (1..number_of_pages).into_iter().collect();
 
-    let futures = future::join_all(pages.iter()
+    let commit_infos_results = future::join_all(pages.iter()
         .map(|item| {
+            println!("Asking details for {}, call number {}", repo_info.name, item);
             client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/commits?q=per_page=100&page={page_num}", owner = repo_info.owner.login, repo_name = repo_info.name, page_num = item))
                 .header("Authorization",  format!("token {token_string}", token_string = token))
                 .header("User-Agent", "Request")
                 .header("Accept", "application/vnd.github.v3+json")
                 .send()
+                .then(|response|{
+                    response.unwrap().text()
+                })
+                .then(|resp_text|{
+                    parse_commit_info(resp_text.unwrap())
+                })
         })).await;
     
-    let commit_info_texts = future::join_all(futures.into_iter()
-            .map(|response| 
-            {
-                let resp = response.unwrap();
-                resp.text()
-            })).await;
-
-    let commits_parsed : Vec<SingleCommitInfo> = commit_info_texts.into_iter()
+    let commit_infos = commit_infos_results.into_iter()
         .flat_map(|res| {
-            parse_commit_info(res.unwrap()).unwrap()
+            res.unwrap()
         }).collect();
-    
-    return Ok((repo_info, commits_parsed));
+
+
+    return Ok((repo_info, commit_infos));
 }
 
-async fn get_repositories_info(token : &String, lang : String, num_of_repos : u64, client : &reqwest::Client) -> Result<Vec<SingleRepoInfo>>
+async fn get_repositories_info(token : &String, lang : String, num_of_repos : u64, client : reqwest::Client) -> Result<Vec<SingleRepoInfo>>
 {
-    let required_calls = num_of_repos / 100;
+    let required_calls = (num_of_repos / 100) + 1;
     let last_page_num_of_repos = num_of_repos % 100;
     let bar = ProgressBar::new(required_calls);
     
 
-    let pages : Vec<u64> = (1..required_calls).into_iter().collect();
+    let pages : Vec<u64> = (0..required_calls).into_iter().collect();
 
     let results_futures = future::join_all(pages.into_iter().
         map(|page|{
@@ -109,15 +152,32 @@ async fn get_repositories_info(token : &String, lang : String, num_of_repos : u6
 
     let results = executor::block_on(results_futures);
 
+
     let response_body_texts_futures = future::join_all(results.into_iter()
-        .map(|result| result.unwrap().text())
+        .map(|result| {
+            let res = match result {
+                Ok(response_ok) => {
+                    match response_ok.error_for_status() {
+                        Ok(_res) => _res,
+                        Err(err) => {
+                               panic!("{}", err);
+                        }
+                    }
+                },
+                Err(err) => panic!("{:#?}", err),
+            };
+            
+
+            res.text()
+        })
     ); 
 
     let response_body_texts = executor::block_on(response_body_texts_futures);
 
     let mut responses_parsed : Vec<RepositoriesInfo> = response_body_texts.into_iter()
         .map(|resp| {
-                let response_parsed = parse_response(resp.unwrap())
+                let response = resp.unwrap();
+                let response_parsed = parse_response(response)
                     .unwrap();
                 bar.inc(1);
                 response_parsed
@@ -125,7 +185,6 @@ async fn get_repositories_info(token : &String, lang : String, num_of_repos : u6
         )
         .collect();
     
-    bar.finish();
 
     responses_parsed.last_mut().unwrap().items.truncate(last_page_num_of_repos.try_into().unwrap());
 
@@ -154,7 +213,7 @@ struct SingleCommitInfo
     commit : SingleCommitDetails,
 }
 
-fn parse_commit_info(req : String) -> serde_json::Result<Vec<SingleCommitInfo>>
+async fn parse_commit_info(req : String) -> serde_json::Result<Vec<SingleCommitInfo>>
 {
     let repositories_info : Vec<SingleCommitInfo> = serde_json::from_str(&req)?;
     Ok(repositories_info)
@@ -198,15 +257,20 @@ use regex::Regex;
 
 //This seems stupid, but could not find a better way
 //If there is a reason not to hire me, this is it
-fn get_num_of_commits_on_main_branch(single_repo_info : &SingleRepoInfo, client : &reqwest::Client, token : &String) -> u64 
+async fn get_num_of_commits_on_main_branch(single_repo_info : &SingleRepoInfo, client : &reqwest::Client, token : &String) -> Result<u64> 
 {
-    let result_future =  client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/commits?per_page=1", owner = single_repo_info.owner.login, repo_name = single_repo_info.name))
+    let result =  client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/commits?q=per_page=1", owner = single_repo_info.owner.login, repo_name = single_repo_info.name))
         .header("Authorization",  format!("token {token_string}", token_string = token))
         .header("User-Agent", "Request")
         .header("Accept", "application/vnd.github.v3+json")
-        .send();
+        .send().await?;
 
-    let result = executor::block_on(result_future).unwrap();
+    let result = result.error_for_status()?;
+
+    if result.headers().contains_key("link") == false {
+        println!("ERR CODE: {:#?}\n{:#?}\n", result.status(), result);
+        return Ok(0);
+    }
 
     let link = &result.headers()["link"];
     
@@ -216,5 +280,5 @@ fn get_num_of_commits_on_main_branch(single_repo_info : &SingleRepoInfo, client 
 
     let num_of_commits = result.last().unwrap().get(1).unwrap().as_str().parse().unwrap();
 
-    return num_of_commits;
+    return Ok(num_of_commits);
 }
