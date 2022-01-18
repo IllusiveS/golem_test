@@ -7,6 +7,7 @@ use futures::future::FutureExt;
 
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
+use std::default;
 use std::env;
 
 use tokio::task;
@@ -19,7 +20,7 @@ struct BusFactoratorArgs {
     language: String,
 
     /// Ammount of repos to evaluate
-    #[clap(long, default_value_t = 1)]
+    #[clap(long, default_value_t = 80)]
     project_count: u64,
 }
 
@@ -55,61 +56,75 @@ async fn main() -> Result<()> {
 
     let spinner_style = ProgressStyle::default_spinner()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-        .template("{prefix:.bold.dim} {spinner} {wide_msg}");
+        .template("{spinner} {wide_msg}");
 
     let bar = ProgressBar::new(parsed_repos_info.len().try_into().unwrap());
 
     bar.set_style(spinner_style);
 
-    let single_repos_infos_results = future::join_all(parsed_repos_info.into_iter()
+    let single_repos_infos_results : Vec<(SingleRepoInfo, Vec<RepoContributorsInfo>)> = future::join_all(parsed_repos_info.into_iter()
         .map(|repo_info| {
             let task_client = client.clone();
             let task_token = token.clone();
             task::spawn( async move {
                 get_single_repo_info(repo_info, task_token, task_client).await
-            }).then(|fut| {
-                let bar_copy = bar.clone();
+            })
+            .then(|fut| {
                 let future_unwrapped = fut.expect("failed to retrieve future from tokio task, something went wrong big time");
                 
-                let repo_info = future_unwrapped.unwrap();
+                let mut repo_info = future_unwrapped.unwrap();
+
+                async move {
+                    let commits_num = repo_info.1.iter().fold(0, |acc, x| acc + x.contributions);
+                    repo_info.0.num_of_commits = commits_num;
+
+                    repo_info
+                }
+            })
+            .then(|repo_info| {
+                let bar_copy = bar.clone();
+
                 async move {
                     bar_copy.inc(1);
-                    bar_copy.set_message(format!("Completed data gathering for repo {}", repo_info.0.full_name));
                     repo_info
                 }
             })
         })).await;
 
-    single_repos_infos_results.iter()
-        .for_each(|repo|{
-            println!("Repo {} with {} commits", repo.0.full_name, repo.1.len());
+    let asd = 1;
+
+    let single_repos_infos_results_parsed : Vec<(SingleRepoInfo, Vec<RepoContributorsInfo>)> = single_repos_infos_results.into_iter()
+        .map(|data| {
+            let mut repo_info = data.0;
+            let most_commits = data.1.first().unwrap();
+            repo_info.bus_factor = most_commits.contributions as f32 / repo_info.num_of_commits as f32;
+
+            //println!("Bus factor {} with user {}", repo_info.bus_factor, data.1.first().unwrap().login);
+            (repo_info, data.1)
+        })
+        .filter(|data| data.0.bus_factor > 0.75f32).collect();
+
+    single_repos_infos_results_parsed.into_iter()
+        .for_each(|data|{
+            println!("project: {name} user: {user} percentage:{bus_factor}", name = data.0.full_name, user = data.1.first().unwrap().login, bus_factor = data.0.bus_factor);
         });
+    
+    
 
     bar.finish();
-    //let single_repos_infos : Vec<(SingleRepoInfo, Vec<SingleCommitInfo>)> = single_repos_infos_results.into_iter().map(|future| future.join()).collect(); 
-    
-    // let single_repos_infos : Vec<(SingleRepoInfo, Vec<SingleCommitInfo>)> = single_repos_infos_results.into_iter()
-    //     .map(|result|{
-    //         result.unwrap().unwrap()
-    //     }).collect();
-    
+
     Ok(())
 }
 
-async fn get_single_repo_info(mut repo_info : SingleRepoInfo, token : String, client : reqwest::Client) -> Result<(SingleRepoInfo, Vec<SingleCommitInfo>)>
+async fn get_single_repo_info(repo_info : SingleRepoInfo, token : String, client : reqwest::Client) -> Result<(SingleRepoInfo, Vec<RepoContributorsInfo>)>
 {
-    let num_of_commits = get_num_of_commits_on_main_branch(&repo_info, &client, &token).await?;
+    let num_of_pages = get_num_of_pages_for_contributors_on_main_branch(&repo_info, &client, &token).await?;
 
-    repo_info.num_of_commits = num_of_commits;
-
-    let number_of_pages = num_of_commits / 100;
-
-    let pages : Vec<u64> = (1..number_of_pages).into_iter().collect();
+    let pages : Vec<u64> = (1..num_of_pages + 2).into_iter().collect();
 
     let commit_infos_results = future::join_all(pages.iter()
         .map(|item| {
-            println!("Asking details for {}, call number {}", repo_info.name, item);
-            client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/commits?q=per_page=100&page={page_num}", owner = repo_info.owner.login, repo_name = repo_info.name, page_num = item))
+            client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=anon=false&page={page_num}&per_page=100&anon=true", owner = repo_info.owner.login, repo_name = repo_info.name, page_num = item))
                 .header("Authorization",  format!("token {token_string}", token_string = token))
                 .header("User-Agent", "Request")
                 .header("Accept", "application/vnd.github.v3+json")
@@ -118,15 +133,18 @@ async fn get_single_repo_info(mut repo_info : SingleRepoInfo, token : String, cl
                     response.unwrap().text()
                 })
                 .then(|resp_text|{
-                    parse_commit_info(resp_text.unwrap())
+                    async move {
+                        let info = parse_contributors_info(resp_text.unwrap()).await;
+                        let info = info.unwrap();
+                        info
+                    }
                 })
         })).await;
-    
-    let commit_infos = commit_infos_results.into_iter()
-        .flat_map(|res| {
-            res.unwrap()
-        }).collect();
 
+    let commit_infos : Vec<RepoContributorsInfo> = commit_infos_results.into_iter()
+        .flat_map(|res| {
+            res
+        }).collect();
 
     return Ok((repo_info, commit_infos));
 }
@@ -138,11 +156,11 @@ async fn get_repositories_info(token : &String, lang : String, num_of_repos : u6
     let bar = ProgressBar::new(required_calls);
     
 
-    let pages : Vec<u64> = (0..required_calls).into_iter().collect();
+    let pages : Vec<u64> = (1..required_calls + 1).into_iter().collect();
 
     let results_futures = future::join_all(pages.into_iter().
         map(|page|{
-            return client.get(format!("https://api.github.com/search/repositories?q=language:{language}&sort=stars&order=desc&per_page=100&page={page_num}", language = lang, page_num = page))
+            return client.get(format!("https://api.github.com/search/repositories?q=language:{language}&sort=stars&order=desc&page={page_num}&per_page=100", language = lang, page_num = page))
                 .header("Authorization",  format!("token {token_string}", token_string = token))
                 .header("User-Agent", "Request")
                 .header("Accept", "application/vnd.github.v3+json")
@@ -150,8 +168,7 @@ async fn get_repositories_info(token : &String, lang : String, num_of_repos : u6
         })
     );
 
-    let results = executor::block_on(results_futures);
-
+    let results = results_futures.await;
 
     let response_body_texts_futures = future::join_all(results.into_iter()
         .map(|result| {
@@ -192,6 +209,20 @@ async fn get_repositories_info(token : &String, lang : String, num_of_repos : u6
 
     return Ok(single_repo_vec);
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RepoContributorsInfo {
+    #[serde(alias = "name")]
+    login : String,
+    contributions : u32,
+}
+
+async fn parse_contributors_info(req : String) -> serde_json::Result<Vec<RepoContributorsInfo>>
+{
+    let repositories_info : Vec<RepoContributorsInfo> = serde_json::from_str(&req)?;
+    Ok(repositories_info)
+}
+
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SingleAuthorDetails
@@ -236,7 +267,9 @@ struct SingleRepoInfo
     owner : OwnerInfo,
     size : u64,
     #[serde(default)]
-    num_of_commits : u64,
+    num_of_commits : u32,
+    #[serde(default)]
+    bus_factor : f32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -257,9 +290,9 @@ use regex::Regex;
 
 //This seems stupid, but could not find a better way
 //If there is a reason not to hire me, this is it
-async fn get_num_of_commits_on_main_branch(single_repo_info : &SingleRepoInfo, client : &reqwest::Client, token : &String) -> Result<u64> 
+async fn get_num_of_pages_for_contributors_on_main_branch(single_repo_info : &SingleRepoInfo, client : &reqwest::Client, token : &String) -> Result<u64> 
 {
-    let result =  client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/commits?q=per_page=1", owner = single_repo_info.owner.login, repo_name = single_repo_info.name))
+    let result =  client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=page=1&per_page=100&anon=true", owner = single_repo_info.owner.login, repo_name = single_repo_info.name))
         .header("Authorization",  format!("token {token_string}", token_string = token))
         .header("User-Agent", "Request")
         .header("Accept", "application/vnd.github.v3+json")
@@ -268,8 +301,7 @@ async fn get_num_of_commits_on_main_branch(single_repo_info : &SingleRepoInfo, c
     let result = result.error_for_status()?;
 
     if result.headers().contains_key("link") == false {
-        println!("ERR CODE: {:#?}\n{:#?}\n", result.status(), result);
-        return Ok(0);
+        return Ok(1);
     }
 
     let link = &result.headers()["link"];
@@ -278,7 +310,7 @@ async fn get_num_of_commits_on_main_branch(single_repo_info : &SingleRepoInfo, c
 
     let result = regex.captures_iter(link.to_str().unwrap());
 
-    let num_of_commits = result.last().unwrap().get(1).unwrap().as_str().parse().unwrap();
+    let num_of_pages = result.last().unwrap().get(1).unwrap().as_str().parse().unwrap();
 
-    return Ok(num_of_commits);
+    return Ok(num_of_pages);
 }
