@@ -13,11 +13,8 @@ use clap::Parser;
 
 use std::env;
 
-
-use reqwest::Result;
-
+use anyhow::Result;
 mod github_provider;
-
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]

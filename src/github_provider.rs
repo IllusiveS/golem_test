@@ -4,7 +4,11 @@ use reqwest::Client;
 
 use futures::executor;
 use futures::future;
+use futures::future::try_join_all;
 use futures::future::FutureExt;
+use futures::future::TryFutureExt;
+
+use anyhow::{Context, Result};
 
 use async_trait::async_trait;
 
@@ -13,11 +17,6 @@ pub struct RepoContributorsInfo {
     #[serde(alias = "name")]
     pub login: String,
     pub contributions: u32,
-}
-
-pub async fn parse_contributors_info(req: String) -> Vec<RepoContributorsInfo> {
-    let repositories_info: Vec<RepoContributorsInfo> = serde_json::from_str::<Vec<RepoContributorsInfo>>(&req).unwrap();
-    repositories_info
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,11 +57,11 @@ pub trait GithubProvider {
         &self,
         langage: String,
         num_of_repos: u32,
-    ) -> Result<Vec<SingleRepoInfo>, reqwest::Error>;
+    ) -> Result<Vec<SingleRepoInfo>>;
     async fn gather_single_repository_info(
         &self,
         repo_info: SingleRepoInfo,
-    ) -> Result<(SingleRepoInfo, Vec<RepoContributorsInfo>), reqwest::Error>;
+    ) -> Result<(SingleRepoInfo, Vec<RepoContributorsInfo>)>;
 }
 
 pub struct APIGithubProvider {
@@ -79,45 +78,68 @@ impl APIGithubProvider {
     }
 }
 
+async fn unpack_responses_from_json<'life, T>(response: Vec<reqwest::Response>) -> Result<Vec<T>>
+where
+    T: Deserialize<'life>,
+{
+    let response_texts_futures: Vec<_> = response
+        .into_iter()
+        .map(|response| response.text())
+        .collect();
+
+    let response_texts = future::try_join_all(response_texts_futures)
+        .await
+        .context("Failed to extract response texts from responses")?;
+
+    let contributor_infos: Result<Vec<_>, serde_json::Error> = response_texts
+        .into_iter()
+        .map(|resp_text| {
+            let val = serde_json::from_str::<T>(&resp_text)?; // ERR: argument requires that `str` is borrowed for `'a`
+            Ok(val)
+        })//ERR `str` dropped here while still borrowed
+        .collect();
+
+    let parsed_values = contributor_infos.context("Failed to parse response into structs")?;
+
+    Ok(parsed_values)
+}
+
 #[async_trait]
 impl GithubProvider for APIGithubProvider {
     async fn gather_repositories_info(
         &self,
         lang: String,
         num_of_repos: u32,
-    ) -> Result<Vec<SingleRepoInfo>, reqwest::Error> {
+    ) -> Result<Vec<SingleRepoInfo>> {
         let required_calls = (num_of_repos / 100) + 1;
         let last_page_num_of_repos = num_of_repos % 100;
 
         let pages: Vec<u32> = (1..required_calls + 1).into_iter().collect();
 
-        let results_futures = future::join_all(pages.into_iter().
+        let results_futures = pages.into_iter().
             map(|page|{
                 return self.client.get(format!("https://api.github.com/search/repositories?q=language:{language}&sort=stars&order=desc&page={page_num}&per_page=100", language = lang, page_num = page))
                     .header("Authorization",  format!("token {token_string}", token_string = self.token))
                     .header("User-Agent", "Request")
                     .header("Accept", "application/vnd.github.v3+json")
                     .send()
+            }).collect();
+
+        let results: Vec<reqwest::Response> = future::try_join_all(results_futures)
+            .await
+            .context("Failed to retrieve responses about individual repositories")?;
+
+        let response_body_texts_futures: Result<Vec<_>> = results
+            .into_iter()
+            .map(|result| {
+                let checked_response = result.error_for_status();
+                checked_response.map(|resp| resp.text())
             })
-        );
+            .collect();
 
-        let results = results_futures.await;
-
-        let response_body_texts_futures = future::join_all(results.into_iter().map(|result| {
-            let res = match result {
-                Ok(response_ok) => match response_ok.error_for_status() {
-                    Ok(_res) => _res,
-                    Err(err) => {
-                        panic!("{}", err);
-                    }
-                },
-                Err(err) => panic!("{:#?}", err),
-            };
-
-            res.text()
-        }));
-
-        let response_body_texts = executor::block_on(response_body_texts_futures);
+        let response_body_texts = future::try_join_all(response_body_texts_futures)
+            .await
+            .context("Failed to retrieve text responses")?;
 
         let mut responses_parsed: Vec<RepositoriesInfo> = response_body_texts
             .into_iter()
@@ -145,40 +167,52 @@ impl GithubProvider for APIGithubProvider {
     async fn gather_single_repository_info(
         &self,
         repo_info: SingleRepoInfo,
-    ) -> Result<(SingleRepoInfo, Vec<RepoContributorsInfo>), reqwest::Error> {
+    ) -> anyhow::Result<(SingleRepoInfo, Vec<RepoContributorsInfo>)> {
         let num_of_pages =
             get_num_of_pages_for_contributors_on_main_branch(&repo_info, &self.client, &self.token)
-                .await?;
+                .await
+                .unwrap();
 
         let pages: Vec<u32> = (1..num_of_pages + 1).into_iter().collect();
 
-        unimplemented!();
-
-        let commit_infos_results = future::join_all(pages.iter()
+        let commit_infos_results : Result<Vec<_>, _> = future::join_all(pages.into_iter()
             .map(|item| {
                 self.client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=anon=false&page={page_num}&per_page=100&anon=true", owner = repo_info.owner.login, repo_name = repo_info.name, page_num = item))
                     .header("Authorization",  format!("token {token_string}", token_string = self.token))
                     .header("User-Agent", "Request")
                     .header("Accept", "application/vnd.github.v3+json")
                     .send()
-                    .then(|response|{
-                        response.map(|result|result.error_for_status().unwrap()).unwrap().text()
-                    })
-                    .then(|resp_text|{
-                        async move {
-                            let info = serde_json::from_str::<Vec<RepoContributorsInfo>>(&resp_text.unwrap()).unwrap();
-                            let info = info;
-                            info
-                        }
-                    })
-            }));
+            })).await.into_iter().collect();
 
-        // let commit_infos: Vec<RepoContributorsInfo> = commit_infos_results
-        //     .into_iter()
-        //     .flat_map(|res| res)
-        //     .collect();
-        
-        //return Ok((repo_info, commit_infos));
+        let commit_infos =
+            commit_infos_results.context("Failed to get response from github API")?;
+
+        let response_texts_futures: Vec<_> = commit_infos
+            .into_iter()
+            .map(|response| response.text())
+            .collect();
+
+        let response_texts = future::try_join_all(response_texts_futures)
+            .await
+            .context("Failed to extract response texts from responses")?;
+
+        let contributor_infos: Result<Vec<_>, serde_json::Error> = response_texts
+            .into_iter()
+            .map(|resp_text| serde_json::from_str::<Vec<RepoContributorsInfo>>(&resp_text))
+            .collect();
+
+        //For some reason i was unable to do ?, i imagine casting serde error into anyhow::Error
+        if contributor_infos.is_err() {
+            anyhow::bail!("Failed to parse response");
+        }
+
+        let commit_infos: Vec<RepoContributorsInfo> = contributor_infos
+            .unwrap()
+            .into_iter()
+            .flat_map(|res| res)
+            .collect();
+
+        return Ok((repo_info, commit_infos));
     }
 }
 
