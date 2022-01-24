@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 
 use async_trait::async_trait;
 
+use log::error;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RepoContributorsInfo {
     #[serde(alias = "name")]
@@ -16,12 +18,12 @@ pub struct RepoContributorsInfo {
     pub contributions: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OwnerInfo {
     pub login: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SingleRepoInfo {
     pub id: u64,
     pub name: String,
@@ -41,11 +43,6 @@ pub struct RepositoriesInfo {
     pub items: Vec<SingleRepoInfo>,
     pub total_count: u64,
     pub incomplete_results: bool,
-}
-
-pub fn parse_response(req: String) -> serde_json::Result<RepositoriesInfo> {
-    let repositories_info = serde_json::from_str::<RepositoriesInfo>(&req)?;
-    Ok(repositories_info)
 }
 
 #[async_trait]
@@ -76,25 +73,15 @@ impl APIGithubProvider {
     }
 }
 
-async fn unpack_responses_from_json<T>(response: Vec<reqwest::Response>) -> Result<Vec<T>>
+async fn unpack_responses_from_json<T>(response: reqwest::Response) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let response_texts_futures: Vec<_> = response
-        .into_iter()
-        .map(|response| response.text())
-        .collect();
+    let response_text = response.text().await?;
+    error!("JSON:\n{}", response_text);
+    let parsed_response = serde_json::from_str::<T>(&response_text);
 
-    let response_texts = future::try_join_all(response_texts_futures)
-        .await
-        .context("Failed to extract response texts from responses")?;
-
-    let contributor_infos: Result<Vec<_>, serde_json::Error> = response_texts
-        .into_iter()
-        .map(|response_text| serde_json::from_str::<T>(&response_text)) //ERR `str` dropped here while still borrowed
-        .collect();
-
-    let parsed_values = contributor_infos.context("Failed to parse response into structs")?;
+    let parsed_values = parsed_response.context("Failed to parse response into structs")?;
 
     Ok(parsed_values)
 }
@@ -109,7 +96,7 @@ impl GithubProvider for APIGithubProvider {
         let required_calls = (num_of_repos / 100) + 1;
         let last_page_num_of_repos = num_of_repos % 100;
 
-        let pages: Vec<u32> = (1..required_calls + 1).into_iter().collect();
+        let pages = 1..(required_calls + 1);
 
         let results_futures : Vec<_> = pages.into_iter().
             map(|page|{
@@ -124,9 +111,13 @@ impl GithubProvider for APIGithubProvider {
             .await
             .context("Failed to retrieve responses about individual repositories")?;
 
-        let mut responses_parsed = unpack_responses_from_json::<RepositoriesInfo>(results)
-            .await
-            .context("Failed to parse all repo info from response")?;
+        let mut responses_parsed = future::try_join_all(
+            results
+                .into_iter()
+                .map(unpack_responses_from_json::<RepositoriesInfo>),
+        )
+        .await
+        .context("Failed to parse all repo info from response")?;
 
         responses_parsed
             .last_mut()
@@ -144,23 +135,13 @@ impl GithubProvider for APIGithubProvider {
 
     async fn gather_single_repository_info(
         &self,
-        repo_info: SingleRepoInfo,
+        mut repo_info: SingleRepoInfo,
     ) -> anyhow::Result<(SingleRepoInfo, Vec<RepoContributorsInfo>)> {
-        let num_of_pages =
-            get_num_of_pages_for_contributors_on_main_branch(&repo_info, &self.client, &self.token)
-                .await
-                .unwrap();
-
-        let pages: Vec<u32> = (1..num_of_pages + 1).into_iter().collect();
-
-        let commit_infos_results : Result<Vec<_>, _> = future::join_all(pages.into_iter()
-            .map(|item| {
-                self.client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=anon=false&page={page_num}&per_page=100&anon=true", owner = repo_info.owner.login, repo_name = repo_info.name, page_num = item))
-                    .header("Authorization",  format!("token {token_string}", token_string = self.token))
-                    .header("User-Agent", "Request")
-                    .header("Accept", "application/vnd.github.v3+json")
-                    .send()
-            })).await.into_iter().collect();
+        let commit_infos_results  = self.client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=anon=false&page=1&per_page=25&anon=true", owner = repo_info.owner.login, repo_name = repo_info.name))
+            .header("Authorization",  format!("token {token_string}", token_string = self.token))
+            .header("User-Agent", "Request")
+            .header("Accept", "application/vnd.github.v3+json")
+            .send().await;
 
         let commit_infos =
             commit_infos_results.context("Failed to get response from github API")?;
@@ -168,50 +149,13 @@ impl GithubProvider for APIGithubProvider {
         let responses_parsed =
             unpack_responses_from_json::<Vec<RepoContributorsInfo>>(commit_infos)
                 .await
-                .context("Failed to parse singl repo info from response")?;
+                .context("Failed to parse singl repo info from response")
+                .unwrap();
 
-        let commit_infos: Vec<RepoContributorsInfo> =
-            responses_parsed.into_iter().flat_map(|res| res).collect();
+        repo_info.num_of_commits = responses_parsed
+            .iter()
+            .fold(0, |acc, info| acc + info.contributions);
 
-        return Ok((repo_info, commit_infos));
+        return Ok((repo_info, responses_parsed));
     }
-}
-
-use regex::Regex;
-
-//This seems stupid, but could not find a better way
-//If there is a reason not to hire me, this is it
-async fn get_num_of_pages_for_contributors_on_main_branch(
-    single_repo_info: &SingleRepoInfo,
-    client: &reqwest::Client,
-    token: &String,
-) -> Result<u32, reqwest::Error> {
-    let result =  client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=page=1&per_page=100&anon=true", owner = single_repo_info.owner.login, repo_name = single_repo_info.name))
-        .header("Authorization",  format!("token {token_string}", token_string = token))
-        .header("User-Agent", "Request")
-        .header("Accept", "application/vnd.github.v3+json")
-        .send().await?;
-
-    let result = result.error_for_status()?;
-
-    if result.headers().contains_key("link") == false {
-        return Ok(1);
-    }
-
-    let link = &result.headers()["link"];
-
-    let regex = Regex::new(r"(?m)page=(\d*)").unwrap();
-
-    let result = regex.captures_iter(link.to_str().unwrap());
-
-    let num_of_pages = result
-        .last()
-        .unwrap()
-        .get(1)
-        .unwrap()
-        .as_str()
-        .parse()
-        .unwrap();
-
-    return Ok(num_of_pages);
 }

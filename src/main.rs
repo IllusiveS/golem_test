@@ -6,15 +6,12 @@ use anyhow::Result;
 
 mod github_provider;
 
-use tokio::task;
-
 use crate::github_provider::GithubProvider;
 use github_provider::APIGithubProvider;
 
-use crate::github_provider::RepoContributorsInfo;
-use crate::github_provider::SingleRepoInfo;
+use log::{info, warn};
 
-use log::warn;
+use simple_logger::SimpleLogger;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -24,12 +21,16 @@ struct BusFactoratorArgs {
     language: String,
 
     /// Ammount of repos to evaluate
-    #[clap(long, default_value_t = 50)]
+    #[clap(long, default_value_t = 15)]
     project_count: u32,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    SimpleLogger::new()
+        .init()
+        .expect("Failed to initialize logger");
+
     let args = BusFactoratorArgs::parse();
 
     let token = match env::var("TOKEN") {
@@ -38,7 +39,7 @@ async fn main() -> Result<()> {
     };
 
     let client = APIGithubProvider::new(token.clone());
-
+    info!("Client established");
     let response: Result<Vec<_>> = client
         .gather_repositories_info(args.language, args.project_count)
         .await;
@@ -53,18 +54,16 @@ async fn main() -> Result<()> {
     let single_repo_info_futures = parsed_repos_info
         .into_iter()
         .map(|repo_info| {
-            let client_ref = client.clone();
-            task::spawn(async move { client_ref.gather_single_repository_info(repo_info) })
+            //This is supposed to be task::spawn, but there is a borrow issue passing an object with async_trait into a future
+            //tokio::task::spawn(client.clone().gather_single_repository_info(repo_info))
+            client.gather_single_repository_info(repo_info)
         })
         .collect::<Vec<_>>();
 
-    let mut parsed_single_repos_info: Vec<_> = vec![];
+    let mut parsed_single_repos_info: Vec<_> = Vec::with_capacity(single_repo_info_futures.len());
 
     for obj in single_repo_info_futures {
-        let result = obj
-            .await
-            .expect("Tokio join handle return failed, something went unexpectedly bad")
-            .await;
+        let result = obj.await;
 
         match result {
             Ok(result) => parsed_single_repos_info.push(result),
@@ -75,24 +74,19 @@ async fn main() -> Result<()> {
         }
     }
 
-    let parsed_single_repos_info: Vec<(SingleRepoInfo, Vec<RepoContributorsInfo>)> =
-        parsed_single_repos_info
-            .into_iter()
-            .map(|data| {
-                let mut repo_info = data.0;
-                let most_commits = data
-                    .1
-                    .first()
-                    .expect("list of contributors to repository is empty");
-                repo_info.bus_factor =
-                    most_commits.contributions as f32 / repo_info.num_of_commits as f32;
+    let parsed_single_repos_info = parsed_single_repos_info.into_iter().map(|data| {
+        let mut repo_info = data.0;
+        let most_commits = data
+            .1
+            .first()
+            .expect("list of contributors to repository is empty");
+        repo_info.bus_factor = most_commits.contributions as f32 / repo_info.num_of_commits as f32;
 
-                (repo_info, data.1)
-            })
-            .filter(|data| data.0.bus_factor > 0.75f32)
-            .collect();
+        (repo_info, data.1)
+    });
+    //.filter(|data| data.0.bus_factor > 0.75f32);
 
-    parsed_single_repos_info.into_iter().for_each(|data| {
+    parsed_single_repos_info.for_each(|data| {
         println!(
             "project: {name} user: {user} percentage:{bus_factor}",
             name = data.0.full_name,
@@ -100,5 +94,6 @@ async fn main() -> Result<()> {
             bus_factor = data.0.bus_factor
         );
     });
+
     Ok(())
 }
