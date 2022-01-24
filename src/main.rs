@@ -7,8 +7,8 @@ use anyhow::Result;
 
 mod github_provider;
 
-use crate::github_provider::GithubProvider;
 use crate::github_provider::APIGithubProvider;
+use crate::github_provider::GithubProvider;
 
 use log::{info, warn, LevelFilter};
 
@@ -30,12 +30,12 @@ struct BusFactoratorArgs {
     log_level: LevelFilter,
 }
 
-fn init_logger(args : &BusFactoratorArgs) {
+fn init_logger(args: &BusFactoratorArgs) {
     if args.log_level != log::LevelFilter::Off {
         let logger = SimpleLogger::new();
 
         let logger = logger.with_level(args.log_level);
-    
+
         logger.init().expect("Failed to initialize logger");
     }
 }
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         Ok(val) => val,
         Err(e) => panic!("couldn't find env variable TOKEN: {}", e),
     };
-    
+
     let client = Arc::new(APIGithubProvider::new(token.clone()));
     info!("Client established");
 
