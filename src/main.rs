@@ -10,7 +10,7 @@ mod github_provider;
 use crate::github_provider::GithubProvider;
 use github_provider::APIGithubProvider;
 
-use log::{info, warn};
+use log::{info, warn, LevelFilter};
 
 use simple_logger::SimpleLogger;
 
@@ -22,17 +22,25 @@ struct BusFactoratorArgs {
     language: String,
 
     /// Ammount of repos to evaluate
-    #[clap(long, default_value_t = 150)]
+    #[clap(long, default_value_t = 50)]
     project_count: u32,
+
+    /// Options are Off,Error,Warn,Info,Debug,Trace,
+    #[clap(short, long, default_value_t = log::LevelFilter::Info)]
+    log_level : LevelFilter,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    SimpleLogger::new()
-        .init()
+    let args = BusFactoratorArgs::parse();
+
+    let logger = SimpleLogger::new();
+
+    let logger = logger.with_level(args.log_level);
+    
+    logger.init()
         .expect("Failed to initialize logger");
 
-    let args = BusFactoratorArgs::parse();
 
     let token = match env::var("TOKEN") {
         Ok(val) => val,
@@ -53,12 +61,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    info!("Gathered repositories");
+
     let single_repo_info_futures = parsed_repos_info
         .into_iter()
         .map(|repo_info| {
-            //This is supposed to be task::spawn, but there is a borrow issue passing an object with async_trait into a future
             tokio::task::spawn(client.clone().gather_single_repository_info(repo_info))
-            //client.clone().gather_single_repository_info(repo_info)
         })
         .collect::<Vec<_>>();
 
@@ -75,6 +83,8 @@ async fn main() -> Result<()> {
             ),
         }
     }
+
+    info!("Gathered individual repo infos");
 
     let parsed_single_repos_info = parsed_single_repos_info.into_iter().map(|data| {
         let mut repo_info = data.0;
