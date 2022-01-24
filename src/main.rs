@@ -1,6 +1,7 @@
 use clap::Parser;
 
 use std::env;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -21,7 +22,7 @@ struct BusFactoratorArgs {
     language: String,
 
     /// Ammount of repos to evaluate
-    #[clap(long, default_value_t = 15)]
+    #[clap(long, default_value_t = 150)]
     project_count: u32,
 }
 
@@ -38,9 +39,10 @@ async fn main() -> Result<()> {
         Err(e) => panic!("couldn't find env variable TOKEN: {}", e),
     };
 
-    let client = APIGithubProvider::new(token.clone());
+    let client = Arc::new(APIGithubProvider::new(token.clone()));
     info!("Client established");
-    let response: Result<Vec<_>> = client
+
+    let response: Result<Vec<_>> = client.clone()
         .gather_repositories_info(args.language, args.project_count)
         .await;
 
@@ -55,15 +57,15 @@ async fn main() -> Result<()> {
         .into_iter()
         .map(|repo_info| {
             //This is supposed to be task::spawn, but there is a borrow issue passing an object with async_trait into a future
-            //tokio::task::spawn(client.clone().gather_single_repository_info(repo_info))
-            client.gather_single_repository_info(repo_info)
+            tokio::task::spawn(client.clone().gather_single_repository_info(repo_info))
+            //client.clone().gather_single_repository_info(repo_info)
         })
         .collect::<Vec<_>>();
 
     let mut parsed_single_repos_info: Vec<_> = Vec::with_capacity(single_repo_info_futures.len());
 
     for obj in single_repo_info_futures {
-        let result = obj.await;
+        let result = obj.await?;
 
         match result {
             Ok(result) => parsed_single_repos_info.push(result),
@@ -83,8 +85,8 @@ async fn main() -> Result<()> {
         repo_info.bus_factor = most_commits.contributions as f32 / repo_info.num_of_commits as f32;
 
         (repo_info, data.1)
-    });
-    //.filter(|data| data.0.bus_factor > 0.75f32);
+    }).filter(|data| data.0.bus_factor > 0.75f32);
+    
 
     parsed_single_repos_info.for_each(|data| {
         println!(

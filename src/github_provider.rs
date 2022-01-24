@@ -11,6 +11,8 @@ use async_trait::async_trait;
 
 use log::error;
 
+use std::sync::Arc;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RepoContributorsInfo {
     #[serde(alias = "name")]
@@ -48,12 +50,12 @@ pub struct RepositoriesInfo {
 #[async_trait]
 pub trait GithubProvider {
     async fn gather_repositories_info(
-        &self,
+        self : Arc<Self>,
         langage: String,
         num_of_repos: u32,
     ) -> Result<Vec<SingleRepoInfo>>;
     async fn gather_single_repository_info(
-        &self,
+        self : Arc<Self>,
         repo_info: SingleRepoInfo,
     ) -> Result<(SingleRepoInfo, Vec<RepoContributorsInfo>)>;
 }
@@ -78,7 +80,7 @@ where
     T: DeserializeOwned,
 {
     let response_text = response.text().await?;
-    error!("JSON:\n{}", response_text);
+    
     let parsed_response = serde_json::from_str::<T>(&response_text);
 
     let parsed_values = parsed_response.context("Failed to parse response into structs")?;
@@ -89,7 +91,7 @@ where
 #[async_trait]
 impl GithubProvider for APIGithubProvider {
     async fn gather_repositories_info(
-        &self,
+        self : Arc<Self>,
         lang: String,
         num_of_repos: u32,
     ) -> Result<Vec<SingleRepoInfo>> {
@@ -134,7 +136,7 @@ impl GithubProvider for APIGithubProvider {
     }
 
     async fn gather_single_repository_info(
-        &self,
+        self : Arc<Self>,
         mut repo_info: SingleRepoInfo,
     ) -> anyhow::Result<(SingleRepoInfo, Vec<RepoContributorsInfo>)> {
         let commit_infos_results  = self.client.get(format!("https://api.github.com/repos/{owner}/{repo_name}/contributors?q=anon=false&page=1&per_page=25&anon=true", owner = repo_info.owner.login, repo_name = repo_info.name))
